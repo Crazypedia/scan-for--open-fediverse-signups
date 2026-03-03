@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Output files (regenerated each run)
+server_status.json
+open_signups.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
