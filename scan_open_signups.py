@@ -84,22 +84,29 @@ async def check_server(
     }
     req_timeout = aiohttp.ClientTimeout(total=timeout)
 
-    # --- Try /api/v2/instance first (Mastodon 4.x) -------------------------
+    # --- Try /api/v2/instance first (Mastodon 4.0+) --------------------------
+    # Docs: https://docs.joinmastodon.org/entities/Instance/
+    # V2 nests registration info under a "registrations" object:
+    #   registrations.enabled           (bool) – are signups enabled?
+    #   registrations.approval_required (bool) – does a moderator need to
+    #                                            approve new accounts?
+    # When approval_required is FALSE the server has open signups → blocklist.
     try:
         url_v2 = f"https://{domain}/api/v2/instance"
         async with session.get(url_v2, timeout=req_timeout) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
-                # v2 returns registrations.approval_required (bool) and
-                # registrations.enabled (bool)
                 regs = data.get("registrations", {})
-                enabled = regs.get("enabled", False)
-                approval = regs.get("approval_required", True)
+                if not isinstance(regs, dict):
+                    regs = {}
+                enabled = bool(regs.get("enabled", False))
+                approval_required = bool(regs.get("approval_required", True))
 
-                if enabled and not approval:
+                # approval_required == False  →  open signup  →  add to list
+                if enabled and not approval_required:
                     result["open_signup"] = True
                     result["registration_mode"] = "open"
-                elif enabled and approval:
+                elif enabled and approval_required:
                     result["open_signup"] = False
                     result["registration_mode"] = "approval"
                 else:
@@ -109,20 +116,38 @@ async def check_server(
     except Exception:
         pass  # fall through to v1
 
-    # --- Fallback to /api/v1/instance (Mastodon 3.x and others) -------------
+    # --- Fallback: /api/v1/instance (Mastodon 2.7–3.x, deprecated in 4.0) --
+    # Docs: https://docs.joinmastodon.org/entities/V1_Instance/
+    # V1 uses two top-level booleans:
+    #   registrations      (bool) – are signups enabled?
+    #   approval_required  (bool) – does a moderator need to approve?
+    # Same rule: approval_required == FALSE → open signup → blocklist.
     try:
         url_v1 = f"https://{domain}/api/v1/instance"
         async with session.get(url_v1, timeout=req_timeout) as resp:
             if resp.status == 200:
                 data = await resp.json(content_type=None)
-                # v1 returns registrations (bool) and approval_required (bool)
-                registrations = data.get("registrations", False)
-                approval = data.get("approval_required", True)
+                registrations_raw = data.get("registrations", False)
+                # Guard: some non-Mastodon servers may return a dict here
+                # (like v2 nesting); treat a non-bool as closed.
+                if isinstance(registrations_raw, dict):
+                    registrations_enabled = bool(
+                        registrations_raw.get("enabled", False)
+                    )
+                    approval_required = bool(
+                        registrations_raw.get("approval_required", True)
+                    )
+                else:
+                    registrations_enabled = bool(registrations_raw)
+                    approval_required = bool(
+                        data.get("approval_required", True)
+                    )
 
-                if registrations and not approval:
+                # approval_required == False  →  open signup  →  add to list
+                if registrations_enabled and not approval_required:
                     result["open_signup"] = True
                     result["registration_mode"] = "open"
-                elif registrations and approval:
+                elif registrations_enabled and approval_required:
                     result["open_signup"] = False
                     result["registration_mode"] = "approval"
                 else:
