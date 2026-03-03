@@ -17,13 +17,15 @@ import csv
 import json
 import logging
 import os
+import re
+import signal
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
-from mastodon import Mastodon
+from mastodon import Mastodon, MastodonError
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
@@ -33,6 +35,8 @@ DEFAULT_TIMEOUT = 15  # seconds per request
 DEFAULT_STATUS_FILE = "server_status.json"
 DEFAULT_OUTPUT_CSV = "open_signups.csv"
 DEFAULT_RECHECK_HOURS = 24  # skip servers checked within this window
+MAX_RESPONSE_BYTES = 1_000_000  # 1 MB – ignore absurdly large responses
+DOMAIN_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,19 +50,57 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 def fetch_known_peers(api_base_url: str, access_token: str) -> list[str]:
     """Use Mastodon.py to retrieve the peer list from the home instance."""
-    client = Mastodon(
-        access_token=access_token,
-        api_base_url=api_base_url,
-    )
-    # /api/v1/instance/peers – returns a plain list of domain strings
-    peers: list[str] = client.instance_peers()
-    log.info("Fetched %d known peers from %s", len(peers), api_base_url)
-    return peers
+    try:
+        client = Mastodon(
+            access_token=access_token,
+            api_base_url=api_base_url,
+            request_timeout=30,
+        )
+        # /api/v1/instance/peers – returns a plain list of domain strings
+        peers: list[str] = client.instance_peers()
+    except MastodonError as exc:
+        log.error("Mastodon API error fetching peers from %s: %s", api_base_url, exc)
+        return []
+    except Exception as exc:
+        log.error("Unexpected error fetching peers from %s: %s", api_base_url, exc)
+        return []
+
+    if not isinstance(peers, list):
+        log.error("Unexpected response type from instance_peers: %s", type(peers))
+        return []
+
+    # Validate and sanitise domain strings
+    clean: list[str] = []
+    for p in peers:
+        if not isinstance(p, str):
+            continue
+        p = p.strip().lower()
+        if p and DOMAIN_RE.match(p):
+            clean.append(p)
+    skipped = len(peers) - len(clean)
+    if skipped:
+        log.warning("Skipped %d invalid domain entries from peer list", skipped)
+    log.info("Fetched %d valid peers from %s", len(clean), api_base_url)
+    return clean
 
 
 # ---------------------------------------------------------------------------
 # Step 2 – Check a single server for open signups
 # ---------------------------------------------------------------------------
+async def _safe_read_json(resp: aiohttp.ClientResponse) -> dict | None:
+    """Read a JSON response body with a size guard to prevent memory abuse."""
+    content_length = resp.headers.get("Content-Length")
+    if content_length and int(content_length) > MAX_RESPONSE_BYTES:
+        return None
+    body = await resp.read()
+    if len(body) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
 async def check_server(
     session: aiohttp.ClientSession,
     domain: str,
@@ -82,7 +124,14 @@ async def check_server(
         "error": None,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
-    req_timeout = aiohttp.ClientTimeout(total=timeout)
+    req_timeout = aiohttp.ClientTimeout(
+        total=timeout,
+        connect=min(timeout, 10),
+        sock_connect=min(timeout, 10),
+        sock_read=timeout,
+    )
+
+    v2_error = None
 
     # --- Try /api/v2/instance first (Mastodon 4.0+) --------------------------
     # Docs: https://docs.joinmastodon.org/entities/Instance/
@@ -93,28 +142,37 @@ async def check_server(
     # When approval_required is FALSE the server has open signups → blocklist.
     try:
         url_v2 = f"https://{domain}/api/v2/instance"
-        async with session.get(url_v2, timeout=req_timeout) as resp:
+        async with session.get(url_v2, timeout=req_timeout, allow_redirects=False) as resp:
             if resp.status == 200:
-                data = await resp.json(content_type=None)
-                regs = data.get("registrations", {})
-                if not isinstance(regs, dict):
-                    regs = {}
-                enabled = bool(regs.get("enabled", False))
-                approval_required = bool(regs.get("approval_required", True))
-
-                # approval_required == False  →  open signup  →  add to list
-                if enabled and not approval_required:
-                    result["open_signup"] = True
-                    result["registration_mode"] = "open"
-                elif enabled and approval_required:
-                    result["open_signup"] = False
-                    result["registration_mode"] = "approval"
+                data = await _safe_read_json(resp)
+                if data is None:
+                    v2_error = "invalid/oversized JSON"
                 else:
-                    result["open_signup"] = False
-                    result["registration_mode"] = "closed"
-                return result
-    except Exception:
-        pass  # fall through to v1
+                    regs = data.get("registrations", {})
+                    if not isinstance(regs, dict):
+                        regs = {}
+                    enabled = bool(regs.get("enabled", False))
+                    approval_required = bool(regs.get("approval_required", True))
+
+                    # approval_required == False  →  open signup  →  add to list
+                    if enabled and not approval_required:
+                        result["open_signup"] = True
+                        result["registration_mode"] = "open"
+                    elif enabled and approval_required:
+                        result["open_signup"] = False
+                        result["registration_mode"] = "approval"
+                    else:
+                        result["open_signup"] = False
+                        result["registration_mode"] = "closed"
+                    return result
+            else:
+                v2_error = f"HTTP {resp.status}"
+    except asyncio.TimeoutError:
+        v2_error = "timeout"
+    except aiohttp.ClientError as exc:
+        v2_error = str(exc)[:120]
+    except Exception as exc:
+        v2_error = str(exc)[:120]
 
     # --- Fallback: /api/v1/instance (Mastodon 2.7–3.x, deprecated in 4.0) --
     # Docs: https://docs.joinmastodon.org/entities/V1_Instance/
@@ -124,12 +182,16 @@ async def check_server(
     # Same rule: approval_required == FALSE → open signup → blocklist.
     try:
         url_v1 = f"https://{domain}/api/v1/instance"
-        async with session.get(url_v1, timeout=req_timeout) as resp:
+        async with session.get(url_v1, timeout=req_timeout, allow_redirects=False) as resp:
             if resp.status == 200:
-                data = await resp.json(content_type=None)
+                data = await _safe_read_json(resp)
+                if data is None:
+                    result["error"] = "invalid/oversized JSON"
+                    return result
+
                 registrations_raw = data.get("registrations", False)
                 # Guard: some non-Mastodon servers may return a dict here
-                # (like v2 nesting); treat a non-bool as closed.
+                # (like v2 nesting); handle both shapes.
                 if isinstance(registrations_raw, dict):
                     registrations_enabled = bool(
                         registrations_raw.get("enabled", False)
@@ -158,8 +220,14 @@ async def check_server(
                 result["error"] = f"HTTP {resp.status}"
     except asyncio.TimeoutError:
         result["error"] = "timeout"
+    except aiohttp.ClientError as exc:
+        result["error"] = str(exc)[:120]
     except Exception as exc:
         result["error"] = str(exc)[:120]
+
+    # If both endpoints failed, prefer the v1 error but note v2 as well
+    if result["error"] is None and v2_error:
+        result["error"] = f"v2: {v2_error}"
 
     return result
 
@@ -172,15 +240,42 @@ async def scan_all(
     concurrency: int,
     timeout: float,
 ) -> list[dict]:
-    """Check every domain with bounded concurrency."""
+    """Check every domain with bounded concurrency and a global safety timeout."""
     semaphore = asyncio.Semaphore(concurrency)
     results: list[dict] = []
 
-    async def _limited_check(session: aiohttp.ClientSession, domain: str):
+    async def _limited_check(session: aiohttp.ClientSession, domain: str) -> dict:
         async with semaphore:
-            return await check_server(session, domain, timeout)
+            try:
+                # Per-task hard deadline: 2x the request timeout to account
+                # for v2 → v1 fallback, plus a small margin.
+                return await asyncio.wait_for(
+                    check_server(session, domain, timeout),
+                    timeout=timeout * 2 + 5,
+                )
+            except asyncio.TimeoutError:
+                return {
+                    "domain": domain,
+                    "open_signup": None,
+                    "registration_mode": None,
+                    "error": "task timeout (stuck)",
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
+            except Exception as exc:
+                return {
+                    "domain": domain,
+                    "open_signup": None,
+                    "registration_mode": None,
+                    "error": f"unexpected: {str(exc)[:100]}",
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                }
 
-    connector = aiohttp.TCPConnector(limit=concurrency, enable_cleanup_closed=True)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,
+        force_close=True,
+    )
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_limited_check(session, d) for d in domains]
         total = len(tasks)
@@ -199,11 +294,26 @@ async def scan_all(
 # Step 4 – Persist status and produce outputs
 # ---------------------------------------------------------------------------
 def load_status(path: str) -> dict:
-    """Load the persistent server status file."""
-    if os.path.exists(path):
+    """Load the persistent server status file, tolerating corruption."""
+    if not os.path.exists(path):
+        return {}
+    try:
         with open(path, "r") as fh:
-            return json.load(fh)
-    return {}
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            log.warning("Status file is not a JSON object – starting fresh")
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Could not load status file %s: %s – starting fresh", path, exc)
+        # Keep the corrupt file around for manual inspection
+        backup = path + ".corrupt"
+        try:
+            os.replace(path, backup)
+            log.info("Moved corrupt status file to %s", backup)
+        except OSError:
+            pass
+        return {}
 
 
 def save_status(path: str, status: dict) -> None:
@@ -298,6 +408,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _save_and_report(status: dict, args: argparse.Namespace) -> None:
+    """Save status + CSV and print summary.  Called on normal exit and on interrupt."""
+    save_status(args.status_file, status)
+
+    open_domains = [
+        domain for domain, info in status.items()
+        if info.get("open_signup") is True
+    ]
+    write_blocklist_csv(args.output, open_domains)
+
+    total = len(status)
+    open_count = len(open_domains)
+    err_count = sum(1 for v in status.values() if v.get("error"))
+    log.info(
+        "Summary: %d servers tracked, %d open signups, %d unreachable/errors",
+        total,
+        open_count,
+        err_count,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -322,7 +453,12 @@ def main() -> None:
         for domain in peers:
             prev = status.get(domain)
             if prev and "checked_at" in prev:
-                last = datetime.fromisoformat(prev["checked_at"])
+                try:
+                    last = datetime.fromisoformat(prev["checked_at"])
+                except (ValueError, TypeError):
+                    # Malformed timestamp – recheck this domain
+                    to_check.append(domain)
+                    continue
                 age_hours = (now - last).total_seconds() / 3600
                 if age_hours < args.recheck_hours:
                     continue
@@ -337,12 +473,34 @@ def main() -> None:
 
     # 3. Run the async scan
     if to_check:
+        # Register signal handler so Ctrl+C saves partial progress
+        interrupted = False
+
+        def _on_sigint(sig, frame):
+            nonlocal interrupted
+            if interrupted:
+                # Second Ctrl+C – hard exit
+                log.warning("Forced exit – saving what we have")
+                _save_and_report(status, args)
+                sys.exit(1)
+            interrupted = True
+            log.warning("Interrupt received – finishing current batch then saving…")
+
+        prev_handler = signal.signal(signal.SIGINT, _on_sigint)
+
         start = time.monotonic()
-        results = asyncio.run(
-            scan_all(to_check, args.concurrency, args.timeout)
-        )
+        try:
+            results = asyncio.run(
+                scan_all(to_check, args.concurrency, args.timeout)
+            )
+        except KeyboardInterrupt:
+            log.warning("Scan interrupted by user")
+            results = []
+        finally:
+            signal.signal(signal.SIGINT, prev_handler)
+
         elapsed = time.monotonic() - start
-        log.info("Scan finished in %.1f s", elapsed)
+        log.info("Scan finished in %.1f s (%d results)", elapsed, len(results))
 
         # Merge results into the persistent status
         for r in results:
@@ -350,26 +508,8 @@ def main() -> None:
     else:
         log.info("Nothing to check – all peers within recheck window.")
 
-    # 4. Save full status
-    save_status(args.status_file, status)
-
-    # 5. Produce blocklist CSV from all currently-known open-signup servers
-    open_domains = [
-        domain for domain, info in status.items()
-        if info.get("open_signup") is True
-    ]
-    write_blocklist_csv(args.output, open_domains)
-
-    # Summary
-    total = len(status)
-    open_count = len(open_domains)
-    err_count = sum(1 for v in status.values() if v.get("error"))
-    log.info(
-        "Summary: %d servers tracked, %d open signups, %d unreachable/errors",
-        total,
-        open_count,
-        err_count,
-    )
+    # 4. Save status + CSV and report
+    _save_and_report(status, args)
 
 
 if __name__ == "__main__":
