@@ -50,6 +50,8 @@ cp .env.example .env
 # Edit .env with your instance URL and access token
 ```
 
+The script automatically loads variables from a `.env` file in the current directory.
+
 ### Getting an access token
 
 1. On your Mastodon instance go to **Preferences → Development → New Application**
@@ -64,9 +66,10 @@ python3 scan_open_signups.py \
   --server https://your-instance.example.com \
   --token YOUR_ACCESS_TOKEN
 
-# Or with environment variable
+# Or with environment variables
+export MASTODON_SERVER=https://your-instance.example.com
 export MASTODON_ACCESS_TOKEN=YOUR_ACCESS_TOKEN
-python3 scan_open_signups.py --server https://your-instance.example.com
+python3 scan_open_signups.py
 
 # Customize concurrency and timeout
 python3 scan_open_signups.py \
@@ -84,7 +87,7 @@ python3 scan_open_signups.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--server` | *(required)* | Your Mastodon instance URL |
+| `--server` | `$MASTODON_SERVER` | Your Mastodon instance URL |
 | `--token` | `$MASTODON_ACCESS_TOKEN` | Admin access token |
 | `--concurrency` | `20` | Max simultaneous peer checks |
 | `--timeout` | `15` | Per-request timeout in seconds |
@@ -105,6 +108,20 @@ example.social,suspend,true,true,Open registration – no moderator approval req
 ```
 
 Import via **Administration → Moderation → Federation → Import**.
+
+## Development and Testing
+
+Install development dependencies:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run tests using `pytest`:
+
+```bash
+pytest
+```
 
 ### `server_status.json`
 

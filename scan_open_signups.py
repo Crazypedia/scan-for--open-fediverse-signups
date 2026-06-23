@@ -23,8 +23,10 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import aiohttp
+from dotenv import load_dotenv
 from mastodon import Mastodon, MastodonError
 
 # ---------------------------------------------------------------------------
@@ -36,6 +38,7 @@ DEFAULT_STATUS_FILE = "server_status.json"
 DEFAULT_OUTPUT_CSV = "open_signups.csv"
 DEFAULT_RECHECK_HOURS = 24  # skip servers checked within this window
 MAX_RESPONSE_BYTES = 1_000_000  # 1 MB – ignore absurdly large responses
+USER_AGENT = "FediverseSignupScanner/1.0"
 DOMAIN_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+$")
 
 logging.basicConfig(
@@ -87,7 +90,7 @@ def fetch_known_peers(api_base_url: str, access_token: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Step 2 – Check a single server for open signups
 # ---------------------------------------------------------------------------
-async def _safe_read_json(resp: aiohttp.ClientResponse) -> dict | None:
+async def _safe_read_json(resp: aiohttp.ClientResponse) -> Optional[Dict[str, Any]]:
     """Read a JSON response body with a size guard to prevent memory abuse."""
     content_length = resp.headers.get("Content-Length")
     if content_length and int(content_length) > MAX_RESPONSE_BYTES:
@@ -101,21 +104,86 @@ async def _safe_read_json(resp: aiohttp.ClientResponse) -> dict | None:
         return None
 
 
+async def _check_v2_instance(
+    session: aiohttp.ClientSession,
+    domain: str,
+    timeout: aiohttp.ClientTimeout,
+) -> Optional[Dict[str, Any]]:
+    """
+    Try /api/v2/instance (Mastodon 4.0+).
+    Returns (open_signup, registration_mode) if successful, else None.
+    """
+    try:
+        url_v2 = f"https://{domain}/api/v2/instance"
+        async with session.get(url_v2, timeout=timeout, allow_redirects=False) as resp:
+            if resp.status == 200:
+                data = await _safe_read_json(resp)
+                if data:
+                    regs = data.get("registrations", {})
+                    if not isinstance(regs, dict):
+                        regs = {}
+                    enabled = bool(regs.get("enabled", False))
+                    approval_required = bool(regs.get("approval_required", True))
+
+                    if enabled and not approval_required:
+                        return {"open_signup": True, "registration_mode": "open"}
+                    elif enabled and approval_required:
+                        return {"open_signup": False, "registration_mode": "approval"}
+                    else:
+                        return {"open_signup": False, "registration_mode": "closed"}
+                return {"error": "invalid/oversized JSON"}
+            return {"error": f"HTTP {resp.status}"}
+    except asyncio.TimeoutError:
+        return {"error": "timeout"}
+    except (aiohttp.ClientError, Exception) as exc:
+        return {"error": str(exc)[:120]}
+
+
+async def _check_v1_instance(
+    session: aiohttp.ClientSession,
+    domain: str,
+    timeout: aiohttp.ClientTimeout,
+) -> Optional[Dict[str, Any]]:
+    """
+    Try /api/v1/instance (Mastodon 2.7–3.x).
+    Returns (open_signup, registration_mode) if successful, else None.
+    """
+    try:
+        url_v1 = f"https://{domain}/api/v1/instance"
+        async with session.get(url_v1, timeout=timeout, allow_redirects=False) as resp:
+            if resp.status == 200:
+                data = await _safe_read_json(resp)
+                if data:
+                    registrations_raw = data.get("registrations", False)
+                    if isinstance(registrations_raw, dict):
+                        enabled = bool(registrations_raw.get("enabled", False))
+                        approval_required = bool(registrations_raw.get("approval_required", True))
+                    else:
+                        enabled = bool(registrations_raw)
+                        approval_required = bool(data.get("approval_required", True))
+
+                    if enabled and not approval_required:
+                        return {"open_signup": True, "registration_mode": "open"}
+                    elif enabled and approval_required:
+                        return {"open_signup": False, "registration_mode": "approval"}
+                    else:
+                        return {"open_signup": False, "registration_mode": "closed"}
+                return {"error": "invalid/oversized JSON"}
+            return {"error": f"HTTP {resp.status}"}
+    except asyncio.TimeoutError:
+        return {"error": "timeout"}
+    except (aiohttp.ClientError, Exception) as exc:
+        return {"error": str(exc)[:120]}
+
+
 async def check_server(
     session: aiohttp.ClientSession,
     domain: str,
     timeout: float,
-) -> dict:
+) -> Dict[str, Any]:
     """
-    Query a remote server's /api/v2/instance (falling back to /api/v1/instance)
-    and determine whether signups are open without moderator approval.
-
-    Returns a dict with:
-      - domain
-      - open_signup (bool | None if unreachable)
-      - registration_mode (str | None)
-      - error (str | None)
-      - checked_at (ISO-8601 timestamp)
+    Query a remote server's API to determine whether signups are open.
+    Falls back from V2 to V1.
     """
     result = {
         "domain": domain,
@@ -131,104 +199,22 @@ async def check_server(
         sock_read=timeout,
     )
 
-    v2_error = None
+    # 1. Try V2
+    v2_res = await _check_v2_instance(session, domain, req_timeout)
+    if v2_res and "error" not in v2_res:
+        result.update(v2_res)
+        return result
 
-    # --- Try /api/v2/instance first (Mastodon 4.0+) --------------------------
-    # Docs: https://docs.joinmastodon.org/entities/Instance/
-    # V2 nests registration info under a "registrations" object:
-    #   registrations.enabled           (bool) – are signups enabled?
-    #   registrations.approval_required (bool) – does a moderator need to
-    #                                            approve new accounts?
-    # When approval_required is FALSE the server has open signups → blocklist.
-    try:
-        url_v2 = f"https://{domain}/api/v2/instance"
-        async with session.get(url_v2, timeout=req_timeout, allow_redirects=False) as resp:
-            if resp.status == 200:
-                data = await _safe_read_json(resp)
-                if data is None:
-                    v2_error = "invalid/oversized JSON"
-                else:
-                    regs = data.get("registrations", {})
-                    if not isinstance(regs, dict):
-                        regs = {}
-                    enabled = bool(regs.get("enabled", False))
-                    approval_required = bool(regs.get("approval_required", True))
+    # 2. Try V1 fallback
+    v1_res = await _check_v1_instance(session, domain, req_timeout)
+    if v1_res and "error" not in v1_res:
+        result.update(v1_res)
+        return result
 
-                    # approval_required == False  →  open signup  →  add to list
-                    if enabled and not approval_required:
-                        result["open_signup"] = True
-                        result["registration_mode"] = "open"
-                    elif enabled and approval_required:
-                        result["open_signup"] = False
-                        result["registration_mode"] = "approval"
-                    else:
-                        result["open_signup"] = False
-                        result["registration_mode"] = "closed"
-                    return result
-            else:
-                v2_error = f"HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        v2_error = "timeout"
-    except aiohttp.ClientError as exc:
-        v2_error = str(exc)[:120]
-    except Exception as exc:
-        v2_error = str(exc)[:120]
-
-    # --- Fallback: /api/v1/instance (Mastodon 2.7–3.x, deprecated in 4.0) --
-    # Docs: https://docs.joinmastodon.org/entities/V1_Instance/
-    # V1 uses two top-level booleans:
-    #   registrations      (bool) – are signups enabled?
-    #   approval_required  (bool) – does a moderator need to approve?
-    # Same rule: approval_required == FALSE → open signup → blocklist.
-    try:
-        url_v1 = f"https://{domain}/api/v1/instance"
-        async with session.get(url_v1, timeout=req_timeout, allow_redirects=False) as resp:
-            if resp.status == 200:
-                data = await _safe_read_json(resp)
-                if data is None:
-                    result["error"] = "invalid/oversized JSON"
-                    return result
-
-                registrations_raw = data.get("registrations", False)
-                # Guard: some non-Mastodon servers may return a dict here
-                # (like v2 nesting); handle both shapes.
-                if isinstance(registrations_raw, dict):
-                    registrations_enabled = bool(
-                        registrations_raw.get("enabled", False)
-                    )
-                    approval_required = bool(
-                        registrations_raw.get("approval_required", True)
-                    )
-                else:
-                    registrations_enabled = bool(registrations_raw)
-                    approval_required = bool(
-                        data.get("approval_required", True)
-                    )
-
-                # approval_required == False  →  open signup  →  add to list
-                if registrations_enabled and not approval_required:
-                    result["open_signup"] = True
-                    result["registration_mode"] = "open"
-                elif registrations_enabled and approval_required:
-                    result["open_signup"] = False
-                    result["registration_mode"] = "approval"
-                else:
-                    result["open_signup"] = False
-                    result["registration_mode"] = "closed"
-                return result
-            else:
-                result["error"] = f"HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        result["error"] = "timeout"
-    except aiohttp.ClientError as exc:
-        result["error"] = str(exc)[:120]
-    except Exception as exc:
-        result["error"] = str(exc)[:120]
-
-    # If both endpoints failed, prefer the v1 error but note v2 as well
-    if result["error"] is None and v2_error:
-        result["error"] = f"v2: {v2_error}"
-
+    # 3. Handle failure
+    v2_err = v2_res.get("error") if v2_res else "unknown"
+    v1_err = v1_res.get("error") if v1_res else "unknown"
+    result["error"] = f"v1: {v1_err} (v2: {v2_err})"
     return result
 
 
@@ -236,10 +222,10 @@ async def check_server(
 # Step 3 – Scan all peers concurrently
 # ---------------------------------------------------------------------------
 async def scan_all(
-    domains: list[str],
+    domains: List[str],
     concurrency: int,
     timeout: float,
-) -> list[dict]:
+) -> List[Dict[str, Any]]:
     """Check every domain with bounded concurrency and a global safety timeout."""
     semaphore = asyncio.Semaphore(concurrency)
     results: list[dict] = []
@@ -276,7 +262,8 @@ async def scan_all(
         ttl_dns_cache=300,
         force_close=True,
     )
-    async with aiohttp.ClientSession(connector=connector) as session:
+    headers = {"User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         tasks = [_limited_check(session, d) for d in domains]
         total = len(tasks)
         done = 0
@@ -293,7 +280,7 @@ async def scan_all(
 # ---------------------------------------------------------------------------
 # Step 4 – Persist status and produce outputs
 # ---------------------------------------------------------------------------
-def load_status(path: str) -> dict:
+def load_status(path: str) -> Dict[str, Any]:
     """Load the persistent server status file, tolerating corruption."""
     if not os.path.exists(path):
         return {}
@@ -316,7 +303,7 @@ def load_status(path: str) -> dict:
         return {}
 
 
-def save_status(path: str, status: dict) -> None:
+def save_status(path: str, status: Dict[str, Any]) -> None:
     """Write the server status file atomically."""
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
@@ -364,8 +351,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--server",
-        required=True,
-        help="Base URL of your home Mastodon instance (e.g. https://mastodon.social)",
+        default=os.environ.get("MASTODON_SERVER"),
+        help="Base URL of your home Mastodon instance (e.g. https://mastodon.social) [default: $MASTODON_SERVER]",
     )
     p.add_argument(
         "--token",
@@ -408,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _save_and_report(status: dict, args: argparse.Namespace) -> None:
+def _save_and_report(status: Dict[str, Any], args: argparse.Namespace) -> None:
     """Save status + CSV and print summary.  Called on normal exit and on interrupt."""
     save_status(args.status_file, status)
 
@@ -430,7 +417,12 @@ def _save_and_report(status: dict, args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    load_dotenv()
     args = parse_args()
+
+    if not args.server:
+        log.error("No server URL provided. Use --server or set MASTODON_SERVER.")
+        sys.exit(1)
 
     if not args.token:
         log.error("No access token provided. Use --token or set MASTODON_ACCESS_TOKEN.")
